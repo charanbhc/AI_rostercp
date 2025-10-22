@@ -1,15 +1,4 @@
-Solving CP-SAT with 25 employees and 31 days... (time limit: 600s)
-Solver status: INFEASIBLE
-❌ No solution found. The constraints are likely too strict or contradictory.
-No roster was generated to save.
-No roster to display.
-(roster_env) charanbhc@Charans-MacBook-Air Downloads % 
----------
 
-
-# pip install ortools pandas python-dateutil openpyxl
-
-# python roster_generator.py --num_employees 25 --year 2025 --month 12 --out dec25_roster.xlsx --public_holidays 2025-06-17 2025-06-23 --solver_time_limit 600
 
 
 
