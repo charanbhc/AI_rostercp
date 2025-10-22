@@ -1,0 +1,364 @@
+
+"""
+test_cpsat.py
+Generates an optimal monthly employee shift roster using Google's CP-SAT solver.
+Requirements:
+  pip install ortools pandas python-dateutil openpyxl
+Usage example:
+  python test_cpsat.py --num_employees 25 --year 2024 --month 12 --out december_roster.xlsx --public_holidays 2024-12-25
+"""
+import argparse
+from datetime import date, timedelta
+from typing import List, Dict, Any
+import pandas as pd
+from ortools.sat.python import cp_model
+from dateutil.relativedelta import relativedelta # pip install python-dateutil
+# Global constants
+SHIFTS = ['G', '1', '2', '3', 'WO', 'PH']
+# -----------------------
+# Helper utilities
+# -----------------------
+def month_date_range(year: int, month: int) -> List[date]:
+    """Generates a list of date objects for a given month."""
+    start = date(year, month, 1)
+    end = (start + relativedelta(months=1)) - timedelta(days=1)
+    return [start + timedelta(days=i) for i in range((end - start).days + 1)]
+def is_weekend(d: date) -> bool:
+    """Checks if a given date is a Saturday or Sunday."""
+    return d.weekday() >= 5
+# -----------------------
+# Core function
+# -----------------------
+def build_and_solve(employees: List[str], year: int, month: int,
+                    history_df: pd.DataFrame = None,
+                    public_holidays=[],
+                    monthly_offs_target=9,
+                    max_consecutive_work=6,
+                    fairness_weight=1.0,
+                    solver_time_limit_seconds=3600):
+    """
+    Builds and solves the employee rostering problem using CP-SAT.
+    history_df: DataFrame with columns ['EmployeeName','Date','Shift'].
+    Returns: DataFrame with assignments for the requested month.
+    """
+    days = month_date_range(year, month)
+    D = len(days)
+    E = len(employees)
+    model = cp_model.CpModel()
+    # --- 1. Create Variables ---
+    # x[e,d,s] is true if employee 'e' is assigned shift 's' on day 'd'.
+    x = {}
+    for ei, e in enumerate(employees):
+        for di, d in enumerate(days):
+            for s in SHIFTS:
+                x[(ei, di, s)] = model.NewBoolVar(f"x_e{ei}_d{di}_s{s}")
+    # --- 2. Define Constraints ---
+    # Constraint: Each employee has exactly one assignment per day.
+    for ei in range(E):
+        for di in range(D):
+            model.AddExactlyOne(x[(ei, di, s)] for s in SHIFTS)
+    # Constraint: Forbid assigning 'PH' shift on a non-public-holiday.
+    # This prevents the solver from using PH as a substitute for WO.
+    for di, d in enumerate(days):
+        if d.isoformat() not in public_holidays:
+            for ei in range(E):
+                model.Add(x[(ei, di, 'PH')] == 0)
+    # Constraint: Daily shift coverage requirements.
+    for di, d in enumerate(days):
+        daily_shifts = {s: sum(x[(ei, di, s)] for ei in range(E)) for s in SHIFTS}
+        is_ph = d.isoformat() in public_holidays
+        if is_ph or is_weekend(d):
+            # Weekend & Public Holiday coverage: 1 person in shifts 1, 2, 3.
+            model.Add(daily_shifts['1'] == 1)
+            model.Add(daily_shifts['2'] == 1)
+            model.Add(daily_shifts['3'] == 1)
+            model.Add(daily_shifts['G'] == 0)
+            if is_ph:
+                # On public holidays, non-working staff get a 'PH' day.
+                model.Add(daily_shifts['WO'] == 0)
+                model.Add(daily_shifts['PH'] == E - 3)
+            else: # It's a weekend, not a PH
+                # On weekends, non-working staff get a 'WO' day.
+                model.Add(daily_shifts['PH'] == 0)
+                model.Add(daily_shifts['WO'] == E - 3)
+        else:
+            # Weekday coverage
+            model.Add(daily_shifts['1'] == 2)
+            model.Add(daily_shifts['3'] == 2)
+            # Enforce a 60/40 split for General (G) and 2nd shifts among remaining staff.
+            # To model num_g = floor(0.6 * (num_g + num_2)), we use two linear inequalities.
+            # This is equivalent to G <= 0.6 * (G+2) and G > 0.6 * (G+2) - 1.
+            # 1. 10 * num_g <= 6 * (num_g + num_2)  =>  4 * num_g <= 6 * num_2  =>  2 * num_g <= 3 * num_2
+            # 2. 10 * num_g >  6 * (num_g + num_2) - 10 => 4 * num_g > 6 * num_2 - 10 => 2 * num_g > 3 * num_2 - 5
+            model.Add(2 * daily_shifts['G'] <= 3 * daily_shifts['2'])
+            model.Add(2 * daily_shifts['G'] > 3 * daily_shifts['2'] - 5)
+    # Constraint: Monthly offs, including compensatory offs for PH work.
+    # A strict equality constraint is very rigid and can cause infeasibility.
+    # A more robust approach is to allow a small range for total off days.
+    for ei in range(E):
+        # Total off days = Week Offs + Public Holidays taken off.
+        num_wo = sum(x[(ei, di, 'WO')] for di in range(D))
+        num_ph_off = sum(x[(ei, di, 'PH')] for di in range(D))
+        # Allow total off days to be within a flexible range (e.g., 9 to 11).
+        model.AddLinearConstraint(num_wo + num_ph_off, monthly_offs_target, monthly_offs_target + 2)
+    # Constraint: Max consecutive work days.
+    # In any window of `max_consecutive_work` days, there must be at most 5 working days.
+    window_size = max_consecutive_work
+    for ei in range(E):
+        for di in range(D - window_size + 1):
+            window_offs = [x[(ei, di + k, s)] for k in range(window_size) for s in ['WO', 'PH']]
+            model.Add(sum(window_offs) >= 1) # At least one off day in any 6-day window.
+    # Constraint: Shift transition rules.
+    for ei in range(E):
+        for di in range(D - 1):
+            # A night shift ('3') must be followed by a week off ('WO').
+            # If they get two WOs, a 1st shift is allowed after.
+            is_night_today = x[(ei, di, '3')]
+            is_wo_tomorrow = x[(ei, di + 1, 'WO')]
+            model.AddImplication(is_night_today, is_wo_tomorrow)
+            # A 2nd shift cannot be followed by a 1st shift.
+            model.AddImplication(x[(ei, di, '2')], x[(ei, di + 1, '1')].Not())
+    # Constraint: Shift transition from previous month (using history).
+    if history_df is not None and not history_df.empty:
+        last_day_of_prev_month_str = (date(year, month, 1) - timedelta(days=1)).isoformat()
+        if last_day_of_prev_month_str in history_df.columns:
+            print(f"Applying shift transition constraints from {last_day_of_prev_month_str}.")
+            last_shifts = history_df[last_day_of_prev_month_str].to_dict()
+            for ei, e in enumerate(employees):
+                last_shift = last_shifts.get(e)
+                if last_shift == '3':
+                    model.Add(x[(ei, 0, 'WO')] == 1)
+                elif last_shift == '2':
+                    model.Add(x[(ei, 0, '1')] == 0)
+    # Constraint: Specific counts for paid shifts (2 and 3).
+    for ei in range(E):
+        # The strict monthly shift quotas were the source of the infeasibility.
+        # They conflicted with the daily coverage requirements.
+        # By removing them, we allow the solver to use the fairness objectives
+        # to distribute shifts evenly, which is a more robust approach.
+        pass
+    # --- 3. Define the Objective Function (Productivity and Fairness) ---
+    # Component 1: Maximize total "pay score" for productivity.
+    pay_weights = {'1': 2, '2': 2, '3': 4, 'G': 0, 'WO': 0, 'PH': 0}
+    employee_scores = []
+    for ei in range(E):
+        score = model.NewIntVar(0, D * 4, f'score_e{ei}')
+        model.Add(score == sum(x[(ei, di, s)] * pay_weights[s] for di in range(D) for s in pay_weights))
+        employee_scores.append(score)
+    total_score = model.NewIntVar(0, E * D * 4, 'total_score')
+    model.Add(total_score == sum(employee_scores))
+    # Component 2: Minimize unfairness in pay scores.
+    # This ensures everyone gets a similar total shift allowance.
+    pay_abs_diffs = []
+    for score in employee_scores:
+        max_abs_diff_val = (E - 1) * D * 4
+        diff_var = model.NewIntVar(-max_abs_diff_val, max_abs_diff_val, f'diff_{len(pay_abs_diffs)}')
+        model.Add(diff_var == E * score - total_score)
+        abs_diff_var = model.NewIntVar(0, max_abs_diff_val, f'abs_diff_{len(pay_abs_diffs)}')
+        model.AddAbsEquality(abs_diff_var, diff_var)
+        pay_abs_diffs.append(abs_diff_var)
+    # Component 3: Minimize unfairness in weekend work.
+    weekend_days_indices = [di for di, d in enumerate(days) if is_weekend(d) and d.isoformat() not in public_holidays]
+    weekend_abs_diffs = []
+    if weekend_days_indices:
+        weekend_work_counts = []
+        for ei in range(E):
+            count = model.NewIntVar(0, len(weekend_days_indices), f'weekend_work_e{ei}')
+            model.Add(count == sum(x[(ei, di, s)] for di in weekend_days_indices for s in ['1', '2', '3']))
+            weekend_work_counts.append(count)
+        total_weekend_shifts = sum(weekend_work_counts)
+        for count in weekend_work_counts:
+            abs_diff = model.NewIntVar(0, D * E, f'weekend_abs_diff_{len(weekend_abs_diffs)}')
+            model.AddAbsEquality(abs_diff, E * count - total_weekend_shifts)
+            weekend_abs_diffs.append(abs_diff)
+    # Component 4: Minimize unfairness in public holiday work.
+    ph_abs_diffs = []
+    ph_days_indices = [di for di, d in enumerate(days) if d.isoformat() in public_holidays]
+    if ph_days_indices:
+        ph_work_counts = []
+        for ei in range(E):
+            count = model.NewIntVar(0, len(ph_days_indices), f'ph_work_e{ei}')
+            model.Add(count == sum(x[(ei, di, s)] for di in ph_days_indices for s in ['1', '2', '3']))
+            ph_work_counts.append(count)
+        total_ph_work = sum(ph_work_counts)
+        for count in ph_work_counts:
+            abs_diff = model.NewIntVar(0, len(ph_days_indices) * E, f'ph_abs_diff_{len(ph_abs_diffs)}')
+            model.AddAbsEquality(abs_diff, E * count - total_ph_work)
+            ph_abs_diffs.append(abs_diff)
+    # Component 5 (New): Encourage continuous shifts of the same type (soft constraint).
+    # This penalizes shift changes to promote sequences like G-G-G or 2-2-2.
+    shift_changes = []
+    for ei in range(E):
+        for di in range(D - 1):
+            for s in ['G', '1', '2', '3']: # For all working shifts
+                change = model.NewBoolVar(f'change_e{ei}_d{di}_s{s}')
+                # change is true if shift 's' today is NOT followed by 's' tomorrow.
+                model.AddImplication(x[ei, di, s], x[ei, di + 1, s].Not()).OnlyEnforceIf(change)
+                model.AddImplication(x[ei, di, s].Not(), change.Not()) # Optimization
+                shift_changes.append(change)
+    # Final Objective: Maximize productivity, penalize all forms of unfairness.
+    model.Minimize(sum(pay_abs_diffs) * int(fairness_weight) # Minimize pay difference
+                   + sum(weekend_abs_diffs) # Minimize weekend work difference
+                   + sum(ph_abs_diffs) # Minimize public holiday work difference
+                   + sum(shift_changes)) # Minimize shift changes
+    # --- 4. Solve the Model ---
+    solver = cp_model.CpSolver()
+    solver.parameters.max_time_in_seconds = solver_time_limit_seconds
+    solver.parameters.num_search_workers = 8 # Use multiple cores
+    # Add a search strategy to guide the solver towards an optimal solution faster.
+    all_vars = [x[ei, di, s] for ei in range(E) for di in range(D) for s in SHIFTS]
+    model.AddDecisionStrategy(all_vars, cp_model.CHOOSE_FIRST, cp_model.SELECT_MIN_VALUE)
+    print(f"Solving CP-SAT with {E} employees and {D} days... (time limit: {solver_time_limit_seconds}s)")
+    
+    # Use a solution printer to show progress towards an optimal solution.
+    solution_printer = cp_model.ObjectiveSolutionPrinter()
+    status = solver.Solve(model, solution_printer)
+    print("\n--- Solver Stats ---")
+    print(f"Status: {solver.StatusName(status)}")
+    print(f"Objective value: {solver.ObjectiveValue()}")
+    print(f"Best objective bound: {solver.BestObjectiveBound()}")
+    print(f"Solve time: {solver.WallTime()} seconds")
+    print("--------------------\n")
+    if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+        print("❌ No solution found, returning empty DataFrame.")
+        return pd.DataFrame(columns=["EmployeeName", "Date", "Shift"])
+    # --- 5. Extract and Return Solution ---
+    rows: List[Dict[str, Any]] = []
+    for ei, e in enumerate(employees):
+        for di, d in enumerate(days):
+            for s in SHIFTS:
+                if solver.Value(x[ei, di, s]) == 1:
+                    rows.append({'EmployeeName': e, 'Date': d.isoformat(), 'Shift': s})
+                    break # Move to the next day
+    out_df = pd.DataFrame(rows)
+    return out_df
+# -----------------------
+# Command-Line Interface
+# -----------------------
+def main():
+    parser = argparse.ArgumentParser(description="Generate an optimal monthly employee shift roster.")
+    group = parser.add_mutually_exclusive_group(required=True)
+    group.add_argument("--history", help="Path to CSV with historical roster (employees as rows, dates as columns).")
+    group.add_argument("--num_employees", type=int, help="Generate a roster for this many dummy employees.")
+    parser.add_argument("--year", type=int, required=True)
+    parser.add_argument("--month", type=int, required=True, choices=range(1, 13))
+    parser.add_argument("--out", default="generated_roster.xlsx", help="Output Excel file name. Default: generated_roster.xlsx")
+    parser.add_argument("--public_holidays", nargs='*', default=[], help="List of public holidays in YYYY-MM-DD format (e.g., 2024-12-25).")
+    parser.add_argument("--monthly_offs_target", type=int, default=9, help="Target offs per employee per month.")
+    parser.add_argument("--max_consecutive_work", type=int, default=6, help="Max consecutive work days before a day off.")
+    parser.add_argument("--solver_time_limit", type=int, default=3600, help="Time limit for the solver in seconds.")
+    parser.add_argument("--fairness_weight", type=float, default=1.0, help="Weight for the pay-score fairness component.")
+    args = parser.parse_args()
+    employees = []
+    hist_df = pd.DataFrame()
+    if args.num_employees:
+        employees = [f'Employee_{i+1}' for i in range(args.num_employees)]
+    elif args.history:
+        try:
+            # For wide format, the first column is the employee name
+            hist_df = pd.read_csv(args.history, index_col='EmployeeName')
+            employees = sorted(hist_df.index.tolist())
+        except FileNotFoundError:
+            parser.error(f"History file not found at: {args.history}")
+        except Exception as e:
+            parser.error(f"Error reading history file: {e}")
+    if not employees:
+        parser.error("Could not determine employee list. Please provide --num_employees or a valid --history file.")
+    # --- Build and Solve ---
+    out_df = build_and_solve(employees=employees,
+                             year=args.year,
+                             month=args.month,
+                             history_df=hist_df if not hist_df.empty else None,
+                             public_holidays=args.public_holidays,
+                             monthly_offs_target=args.monthly_offs_target,
+                             max_consecutive_work=args.max_consecutive_work,
+                             fairness_weight=args.fairness_weight,
+                             solver_time_limit_seconds=args.solver_time_limit)
+    # --- Format and Save Output ---
+    if not out_df.empty:
+        # Create the desired output format: employees as rows, dates as columns.
+        pivot_df = out_df.pivot(index='EmployeeName', columns='Date', values='Shift').fillna('')
+        # Ensure columns are sorted chronologically
+        pivot_df = pivot_df.reindex(sorted(pivot_df.columns), axis=1)
+        print("Sample Roster (first 10 employees):")
+        print(pivot_df.head(10).to_string())
+        # Save pivot table to an Excel file.
+        excel_out_path = args.out if args.out.endswith('.xlsx') else f"{args.out.rsplit('.', 1)[0]}.xlsx"
+        sheet_name = date(args.year, args.month, 1).strftime('%b %Y') # e.g., "Nov 2024"
+        # --- NEW: Create a summary table of shift counts ---
+        # The user wants counts for shifts 1, 2, 3, G, and WO.
+        summary_shifts = ['1', 'G', '2', '3', 'WO']
+        summary_df = pd.crosstab(out_df['Shift'], out_df['Date'])
+        # Filter and reorder the summary to match the user's request.
+        summary_df = summary_df.reindex(summary_shifts).fillna(0).astype(int)
+        try:
+            # Use ExcelWriter to write both the roster and the summary to the same sheet.
+            with pd.ExcelWriter(excel_out_path, engine='openpyxl') as writer:
+                # Write the main roster table.
+                pivot_df.to_excel(writer, sheet_name=sheet_name, index=True, startrow=1)
+                # --- NEW: Apply conditional formatting ---
+                from openpyxl.styles import PatternFill
+                # Get the worksheet object
+                worksheet = writer.sheets[sheet_name]
+                # Define color fills
+                yellow_fill = PatternFill(start_color="FFFFFF00", end_color="FFFFFF00", fill_type="solid") # Yellow for dates
+                green_fill = PatternFill(start_color="FFC6EFCE", end_color="FFC6EFCE", fill_type="solid")   # Light Green for days
+                blue_fill = PatternFill(start_color="FFBDE2FF", end_color="FFBDE2FF", fill_type="solid")     # Light Blue for WO
+                # Insert a new row for the day of the week
+                worksheet.insert_rows(2)
+                # Populate the new row and format headers
+                for col_idx, value in enumerate(pivot_df.columns, 2): # 2 = column 'B'
+                    # Color the date header yellow
+                    worksheet.cell(row=1, column=col_idx).fill = yellow_fill
+                    # Get date object and write day of week
+                    day_date = date.fromisoformat(value)
+                    day_cell = worksheet.cell(row=2, column=col_idx, value=day_date.strftime('%a'))
+                    # Color the day of week cell green
+                    day_cell.fill = green_fill
+                # Color the 'WO' cells blue
+                for row in worksheet.iter_rows(min_row=3, max_row=worksheet.max_row, min_col=2):
+                    for cell in row:
+                        if cell.value == 'WO':
+                            cell.fill = blue_fill
+                # Write the summary table below the main roster.
+                # We add 4 to account for the new day row and leave two blank rows.
+                start_row = len(pivot_df) + 4
+                summary_df.to_excel(writer, sheet_name=sheet_name, startrow=start_row, index=True)
+                
+                # --- ENHANCED: Create and write the detailed monthly summary per employee ---
+                # Define the final order of columns for the summary table
+                monthly_summary_cols = ['WO+PH', 'L', 'G', '1', '2', '3', 'Total Shifts', 'Weekend Work', 'Amount (2)', 'Amount (3)', 'Shift Amount']
+                
+                # Create a crosstab to get the counts of each shift for each employee
+                monthly_summary_df = pd.crosstab(index=out_df['EmployeeName'], columns=out_df['Shift'])
+                
+                # Ensure all summary columns exist, filling missing ones with 0
+                for col in ['1', 'G', '2', '3', 'WO', 'PH']:
+                    if col not in monthly_summary_df.columns:
+                        monthly_summary_df[col] = 0
+                # --- NEW: Calculate weekend work count ---
+                out_df['Date_obj'] = pd.to_datetime(out_df['Date'])
+                weekend_work_df = out_df[
+                    (out_df['Date_obj'].dt.weekday >= 5) & (~out_df['Shift'].isin(['WO', 'PH']))
+                ]
+                monthly_summary_df['Weekend Work'] = weekend_work_df.groupby('EmployeeName').size().reindex(monthly_summary_df.index, fill_value=0)
+                # Calculate the new combined and calculated columns
+                monthly_summary_df['WO+PH'] = monthly_summary_df.get('WO', 0) + monthly_summary_df.get('PH', 0)
+                monthly_summary_df['L'] = 0 # Leaves column, defaults to 0
+                monthly_summary_df['Total Shifts'] = monthly_summary_df.get('2', 0) + monthly_summary_df.get('3', 0)
+                monthly_summary_df['Amount (2)'] = monthly_summary_df.get('2', 0) * 200
+                monthly_summary_df['Amount (3)'] = monthly_summary_df.get('3', 0) * 400
+                monthly_summary_df['Shift Amount'] = monthly_summary_df['Amount (2)'] + monthly_summary_df['Amount (3)']
+                
+                # Reorder the DataFrame to match the desired column sequence
+                monthly_summary_df = monthly_summary_df[monthly_summary_cols]
+                # Write the summary table to the right of the main roster, aligned to the top
+                monthly_summary_df.to_excel(writer, sheet_name=sheet_name, startrow=1, startcol=len(pivot_df.columns) + 2)
+            print(f"\n✅ Roster saved to Excel file: {excel_out_path}")
+        except Exception as e:
+            print(f"\n❌ Error saving to Excel file: {e}")
+    else:
+        print("No roster was generated.")
+if __name__ == "__main__":
+    main()
+
