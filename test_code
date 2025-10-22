@@ -5,6 +5,15 @@ No roster was generated to save.
 No roster to display.
 (roster_env) charanbhc@Charans-MacBook-Air Downloads % 
 ---------
+
+
+# pip install ortools pandas python-dateutil openpyxl
+
+# python roster_generator.py --num_employees 25 --year 2025 --month 12 --out dec25_roster.xlsx --public_holidays 2025-06-17 2025-06-23 --solver_time_limit 600
+
+
+
+
 import argparse
 import math
 import os
@@ -12,7 +21,6 @@ from datetime import date, timedelta
 from typing import List, Dict, Any
 import pandas as pd
 from dateutil.relativedelta import relativedelta
-from openpyxl.styles import PatternFill
 from ortools.sat.python import cp_model
 import sys
 
@@ -64,9 +72,10 @@ def add_daily_coverage_constraints(model: cp_model.CpModel, x: Dict, E: int, D: 
             model.Add(daily_shifts['3'] == 2)
             model.Add(daily_shifts['PH'] == 0)
             rem = E - 4
-            g_target = math.ceil(rem * 0.7)
-            model.Add(daily_shifts['G'] >= max(0, g_target - 1))
-            model.Add(daily_shifts['G'] <= g_target + 1)
+            g_target_70 = int(rem * 0.7)
+            g_target_60 = int(rem * 0.6)
+            model.Add(daily_shifts['G'] >= min(g_target_60, g_target_70) - 3)
+            model.Add(daily_shifts['G'] <= max(g_target_60, g_target_70) + 3)
             model.Add(daily_shifts['2'] == rem - daily_shifts['G'])
 
 def add_total_off_days_constraint(model: cp_model.CpModel, x: Dict, E: int, D: int, days: List[date], public_holidays: List[str]):
@@ -91,40 +100,43 @@ def add_work_and_shift_pattern_constraints(model: cp_model.CpModel, x: Dict, E: 
     for ei in range(E):
         for di in range(D - 1):
             model.AddImplication(x[(ei, di, '2')], x[(ei, di + 1, '1')].Not())
-    for ei in range(E):
-        for s in ['G', '2', '3']:
-            for di in range(D - 6):
-                model.Add(sum(x[(ei, di + k, s)] for k in range(7)) >= 6 * x[(ei, di, s)])
 
 def add_monthly_shift_quota_constraints(model: cp_model.CpModel, x: Dict, E: int, D: int):
     for ei in range(E):
         count_paid = sum(x[(ei, di, s)] for di in range(D) for s in ['2', '3'])
         model.Add(count_paid == 12)
 
+def add_fairness_and_sentiment_constraints(model: cp_model.CpModel, x: Dict, E: int, D: int, days: List[date], public_holidays: List[str]):
+    # For each 'rare' shift (PH, WO, weekend 1/2/3), try to ensure all employees take at least one before anyone gets a second
+    # PH & weekend: force round-robin sentiment
+    # For each rare slot, track assignment counts
+    ph_indices = [di for di, d in enumerate(days) if d.isoformat() in public_holidays]
+    weekend_indices = [di for di, d in enumerate(days) if is_weekend(d)]
+    rare_indices = sorted(set(ph_indices + weekend_indices))
+    # tracks for each engineer their assignment to PH+WO+weekend 1,2,3 shifts
+    for s in ['1', '2', '3']:
+        get_counts = [sum(x[(ei, di, s)] for di in rare_indices) for ei in range(E)]
+        max_rare = model.NewIntVar(0, D, 'max_rare')
+        min_rare = model.NewIntVar(0, D, 'min_rare')
+        for cnt in get_counts:
+            model.Add(min_rare <= cnt)
+            model.Add(cnt <= max_rare)
+        # Encourage fairness (difference <= 1)
+        model.Add(max_rare - min_rare <= 1)
+
 def define_objective_function(model: cp_model.CpModel, x: Dict, E: int, D: int, days: List[date]):
-    transitions = []
-    blocks = []
-    for ei in range(E):
-        for di in range(D-1):
-            for s in ['G', '2', '3']:
-                change = model.NewBoolVar(f'change_e{ei}_d{di}_s{s}')
-                model.AddBoolAnd([x[(ei, di, s)], x[(ei, di+1, s)].Not()]).OnlyEnforceIf(change)
-                transitions.append(change)
-            for bad in [('G','1'), ('2','G'), ('3','2')]:
-                bad_var = model.NewBoolVar(f'bad_{bad[0]}_{bad[1]}_e{ei}_d{di}')
-                model.AddBoolAnd([x[(ei, di, bad[0])], x[(ei, di+1, bad[1])]]).OnlyEnforceIf(bad_var)
-                transitions.append(bad_var)
-        for s in ['G','2','3']:
-            for di in range(D-6):
-                block = model.NewBoolVar(f'block7_e{ei}_s{s}_d{di}')
-                block_expr = [x[(ei, di+k, s)] for k in range(7)]
-                model.AddBoolAnd(block_expr).OnlyEnforceIf(block)
-                blocks.append(block)
-    model.Minimize(sum(transitions)*2 - sum(blocks)*5)
+    # Distribute rare shifts (PH, weekends) and paid shifts as evenly as possible
+    rare_shifts_gaps = []
+    paid_shift_counts = [sum(x[(ei, di, s)] for di in range(D) for s in ['2', '3']) for ei in range(E)]
+    for s in ['1', '2', '3']:
+        shift_counts = [sum(x[(ei, di, s)] for di in range(D)) for ei in range(E)]
+        avg = sum(shift_counts) // E
+        rare_shifts_gaps.extend([abs(shift_counts[ei] - avg) for ei in range(E)])
+    paid_avg = sum(paid_shift_counts)//E
+    paid_gaps = [abs(c - paid_avg) for c in paid_shift_counts]
+    model.Minimize(sum(rare_shifts_gaps)*8 + sum(paid_gaps)*10)
 
 def assign_compensatory_wos(roster_df, days, employees, public_holidays):
-    if roster_df.empty:
-        return roster_df
     ph_days = [i for i, d in enumerate(days) if d.isoformat() in public_holidays]
     for ph_day in ph_days:
         worked = roster_df[roster_df['Date'] == days[ph_day].isoformat()]
@@ -149,6 +161,7 @@ def generate_roster(employees: List[str], year: int, month: int, public_holidays
     add_total_off_days_constraint(model, x, E, D, days, public_holidays)
     add_work_and_shift_pattern_constraints(model, x, E, D)
     add_monthly_shift_quota_constraints(model, x, E, D)
+    add_fairness_and_sentiment_constraints(model, x, E, D, days, public_holidays)
     define_objective_function(model, x, E, D, days)
     solver = cp_model.CpSolver()
     solver.parameters.max_time_in_seconds = solver_time_limit
@@ -171,9 +184,6 @@ def generate_roster(employees: List[str], year: int, month: int, public_holidays
     return out_df
 
 def print_shift_grid(out_df, year, month):
-    if out_df.empty:
-        print("No roster to display.")
-        return
     days = sorted(out_df['Date'].unique())
     day_nums = [date.fromisoformat(d).day for d in days]
     day_names = [date.fromisoformat(d).strftime('%a') for d in days]
@@ -236,7 +246,7 @@ def main():
     parser.add_argument("--month", type=int, required=True, choices=range(1, 13))
     parser.add_argument("--out", default="generated_roster.xlsx")
     parser.add_argument("--public_holidays", nargs='*', default=[])
-    parser.add_argument("--solver_time_limit", type=int, default=600)  # 600 seconds default
+    parser.add_argument("--solver_time_limit", type=int, default=600)
     args = parser.parse_args()
     employees = [f'Employee_{i+1}' for i in range(args.num_employees)]
     out_df = generate_roster(
