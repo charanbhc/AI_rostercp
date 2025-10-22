@@ -1,0 +1,253 @@
+#!/usr/bin/env python3
+"""
+roster_generator_block_exactWO.py
+
+Generates a monthly shift roster that enforces block-style assignments
+and exact equal WO count per employee.
+
+Requires:
+  pip install ortools pandas python-dateutil openpyxl
+"""
+import argparse
+import os
+from datetime import date, timedelta, datetime
+from typing import List, Dict
+import pandas as pd
+from dateutil.relativedelta import relativedelta
+from ortools.sat.python import cp_model
+
+SHIFTS = ['1', 'G', '2', '3', 'WO']
+MIN_BLOCK = 3
+MAX_PAID_SHIFTS = 12
+MAX_CONSEC_WORK = 5
+MAX_CONSEC_3 = 3
+
+def month_date_range(year: int, month: int) -> List[date]:
+    start = date(year, month, 1)
+    end = (start + relativedelta(months=1)) - timedelta(days=1)
+    return [start + timedelta(days=i) for i in range((end - start).days + 1)]
+
+def is_weekend(d: date) -> bool:
+    return d.weekday() >= 5  # Sat=5, Sun=6
+
+def parse_public_holidays(raw_ph: List[str], year: int, month: int) -> List[str]:
+    ph_dates = []
+    for s in raw_ph:
+        dt = datetime.fromisoformat(s).date()
+        if dt.year == year and dt.month == month:
+            ph_dates.append(dt.isoformat())
+    return sorted(set(ph_dates))
+
+def build_and_solve(employees: List[str], year: int, month: int,
+                    public_holidays: List[str], solver_time_limit: int = 120) -> pd.DataFrame:
+    days = month_date_range(year, month)
+    D = len(days)
+    E = len(employees)
+    ph_set = set(public_holidays)
+    day_is_ph = [(days[i].isoformat() in ph_set) for i in range(D)]
+    day_is_wknd = [is_weekend(d) for d in days]
+
+    model = cp_model.CpModel()
+
+    # Decision vars
+    x = {}
+    for ei in range(E):
+        for di in range(D):
+            for s in SHIFTS:
+                x[(ei, di, s)] = model.NewBoolVar(f"x_e{ei}_d{di}_s{s}")
+
+    # One shift per employee per day
+    for ei in range(E):
+        for di in range(D):
+            model.AddExactlyOne(x[(ei, di, s)] for s in SHIFTS)
+
+    # Daily coverage
+    for di in range(D):
+        is_ph = day_is_ph[di]
+        is_wknd = day_is_wknd[di]
+        count = {s: sum(x[(ei, di, s)] for ei in range(E)) for s in SHIFTS}
+        if is_ph or is_wknd:
+            model.Add(count['1'] == 1)
+            model.Add(count['2'] == 1)
+            model.Add(count['3'] == 1)
+            model.Add(count['G'] == 0)
+            model.Add(count['WO'] == E - 3)
+        else:
+            model.Add(count['1'] == 2)
+            model.Add(count['3'] == 2)
+            model.Add(3 * count['G'] >= 7 * count['2'] - 7)
+            model.Add(3 * count['G'] <= 7 * count['2'] + 7)
+
+    # --- Equal WO count (exact equality) ---
+    num_weekend_days = sum(1 for d in days if is_weekend(d))
+    num_ph_days = len(public_holidays)
+    exact_wo_target = num_weekend_days + num_ph_days
+
+    for ei in range(E):
+        num_WO = sum(x[(ei, di, 'WO')] for di in range(D))
+        num_paid = sum(x[(ei, di, s)] for di in range(D) for s in ['2', '3'])
+        model.Add(num_paid <= MAX_PAID_SHIFTS)
+        model.Add(num_WO == exact_wo_target)  # ← exact equal WO count
+
+        # PH worked compensation
+        ph_worked_bools = []
+        for di in range(D):
+            if day_is_ph[di]:
+                pb = model.NewBoolVar(f"ph_worked_e{ei}_d{di}")
+                model.AddBoolOr([x[(ei, di, '1')], x[(ei, di, '2')], x[(ei, di, '3')]]).OnlyEnforceIf(pb)
+                model.AddBoolAnd([x[(ei, di, '1')].Not(),
+                                  x[(ei, di, '2')].Not(),
+                                  x[(ei, di, '3')].Not()]).OnlyEnforceIf(pb.Not())
+                ph_worked_bools.append(pb)
+        if ph_worked_bools:
+            model.Add(sum(ph_worked_bools) <= num_WO)
+
+    # Max consecutive working days
+    window = MAX_CONSEC_WORK + 1
+    for ei in range(E):
+        for di in range(D - window + 1):
+            offs = [x[(ei, di + k, 'WO')] for k in range(window)]
+            model.Add(sum(offs) >= 1)
+
+    # Max consecutive '3'
+    nw = MAX_CONSEC_3 + 1
+    for ei in range(E):
+        for di in range(D - nw + 1):
+            model.Add(sum(x[(ei, di + k, '3')] for k in range(nw)) <= MAX_CONSEC_3)
+
+    # No 1 after 2
+    for ei in range(E):
+        for di in range(D - 1):
+            model.AddImplication(x[(ei, di, '2')], x[(ei, di + 1, '1')].Not())
+
+    # Allowed transitions 1→G→2→3→WO
+    allowed_next = {
+        '1': {'G', 'WO'},
+        'G': {'2', 'WO'},
+        '2': {'3', 'WO'},
+        '3': {'3', 'WO'},
+        'WO': {'1', 'G', '2', '3', 'WO'}
+    }
+    for ei in range(E):
+        for di in range(D - 1):
+            for s_curr in SHIFTS:
+                for s_next in SHIFTS:
+                    if s_next not in allowed_next[s_curr]:
+                        model.AddImplication(x[(ei, di, s_curr)], x[(ei, di + 1, s_next)].Not())
+
+    # Block-style minimums
+    start_block = {}
+    for ei in range(E):
+        for di in range(D):
+            for s in ['G', '2', '3']:
+                start_block[(ei, di, s)] = model.NewBoolVar(f"start_e{ei}_d{di}_s{s}")
+                model.AddImplication(start_block[(ei, di, s)], x[(ei, di, s)])
+                if di > 0:
+                    model.AddImplication(start_block[(ei, di, s)], x[(ei, di - 1, s)].Not())
+                else:
+                    model.AddImplication(x[(ei, di, s)], start_block[(ei, di, s)])
+
+    for ei in range(E):
+        for di in range(D):
+            for s in ['G', '2', '3']:
+                start = start_block[(ei, di, s)]
+                available = D - di
+                required = min(MIN_BLOCK, available)
+                model.Add(sum(x[(ei, di + k, s)] for k in range(required)) >= required).OnlyEnforceIf(start)
+
+    # After 3×3 block -> WO
+    for ei in range(E):
+        for di in range(D - 3):
+            three3 = model.NewBoolVar(f"three3_e{ei}_start{di}")
+            model.AddBoolAnd([x[(ei, di + k, '3')] for k in range(3)]).OnlyEnforceIf(three3)
+            model.AddBoolOr([x[(ei, di + k, '3')].Not() for k in range(3)]).OnlyEnforceIf(three3.Not())
+            model.AddImplication(three3, x[(ei, di + 3, 'WO')])
+
+    # First-week Sun–Mon–Tue (3) => Wed WO
+    first_sunday = None
+    for idx, d in enumerate(days):
+        if d.weekday() == 6:
+            first_sunday = idx
+            break
+    if first_sunday is not None and first_sunday + 3 < D:
+        di = first_sunday
+        if days[di + 1].weekday() == 0 and days[di + 2].weekday() == 1 and days[di + 3].weekday() == 2:
+            for ei in range(E):
+                b = model.NewBoolVar(f"firstweek_3block_e{ei}")
+                model.AddBoolAnd([x[(ei, di + k, '3')] for k in range(3)]).OnlyEnforceIf(b)
+                model.AddImplication(b, x[(ei, di + 3, 'WO')])
+
+    # Objective: fairness + few changes
+    paid_counts = [sum(x[(ei, di, s)] for di in range(D) for s in ['2', '3']) for ei in range(E)]
+    total_paid = sum(paid_counts)
+    abs_diffs = []
+    for ei, pc in enumerate(paid_counts):
+        diff = model.NewIntVar(-D * E, D * E, f"diff_paid_e{ei}")
+        model.Add(diff == E * pc - total_paid)
+        absd = model.NewIntVar(0, D * E, f"absd_paid_e{ei}")
+        model.AddAbsEquality(absd, diff)
+        abs_diffs.append(absd)
+
+    change_vars = []
+    for ei in range(E):
+        for di in range(D - 1):
+            diff_var = model.NewBoolVar(f"diff_e{ei}_d{di}")
+            same_indicators = []
+            for s in SHIFTS:
+                same = model.NewBoolVar(f"same_e{ei}_d{di}_s{s}")
+                model.AddBoolAnd([x[(ei, di, s)], x[(ei, di + 1, s)]]).OnlyEnforceIf(same)
+                model.AddBoolOr([x[(ei, di, s)].Not(), x[(ei, di + 1, s)].Not()]).OnlyEnforceIf(same.Not())
+                same_indicators.append(same)
+            model.AddBoolOr(same_indicators).OnlyEnforceIf(diff_var.Not())
+            change_vars.append(diff_var)
+
+    model.Minimize(100 * sum(abs_diffs) + 1 * sum(change_vars))
+
+    solver = cp_model.CpSolver()
+    solver.parameters.max_time_in_seconds = solver_time_limit
+    solver.parameters.num_search_workers = os.cpu_count() or 8
+    print(f"Solving with E={E}, D={D}, exact WO={exact_wo_target}")
+    status = solver.Solve(model)
+    print("Status:", solver.StatusName(status))
+
+    if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+        print("No feasible solution found.")
+        return pd.DataFrame()
+
+    rows = []
+    for ei, name in enumerate(employees):
+        for di, d in enumerate(days):
+            for s in SHIFTS:
+                if solver.Value(x[(ei, di, s)]) == 1:
+                    rows.append({'EmployeeName': name, 'Date': d.isoformat(), 'Shift': s})
+                    break
+    return pd.DataFrame(rows)
+
+def save_to_excel(df: pd.DataFrame, year: int, month: int, filename: str, employees: List[str]):
+    if df.empty:
+        print("Empty roster, nothing to save.")
+        return
+    pivot = df.pivot(index='EmployeeName', columns='Date', values='Shift').reindex(index=employees).fillna('')
+    pivot = pivot.reindex(sorted(pivot.columns), axis=1)
+    with pd.ExcelWriter(filename, engine='openpyxl') as writer:
+        pivot.to_excel(writer, sheet_name=date(year, month, 1).strftime("%b %Y"))
+    print(f"Saved roster: {filename}")
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--num_employees", type=int, required=True)
+    parser.add_argument("--year", type=int, required=True)
+    parser.add_argument("--month", type=int, required=True)
+    parser.add_argument("--out", type=str, default="roster_block_exactWO.xlsx")
+    parser.add_argument("--public_holidays", nargs='*', default=[])
+    parser.add_argument("--solver_time_limit", type=int, default=180)
+    args = parser.parse_args()
+
+    employees = [f"Employee_{i+1}" for i in range(args.num_employees)]
+    ph_in_month = parse_public_holidays(args.public_holidays, args.year, args.month)
+    print("Public holidays:", ph_in_month)
+    df = build_and_solve(employees, args.year, args.month, ph_in_month, args.solver_time_limit)
+    save_to_excel(df, args.year, args.month, args.out, employees)
+
+if __name__ == "__main__":
+    main()
