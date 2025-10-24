@@ -56,11 +56,11 @@ def add_daily_coverage_constraints(model: cp_model.CpModel, x: Dict, E: int, D: 
             model.Add(daily_shifts['3'] == 2)
             model.Add(daily_shifts['PH'] == 0)
             rem = E - 4
-            # Flexible G/2 split: allow 57% to 73% for maximum feasibility (±3)
             g_target_70 = int(rem * 0.7)
             g_target_60 = int(rem * 0.6)
-            model.Add(daily_shifts['G'] >= min(g_target_60, g_target_70) - 3)
-            model.Add(daily_shifts['G'] <= max(g_target_60, g_target_70) + 3)
+            # Very flexible G/2, real HR rules for feasibility
+            model.Add(daily_shifts['G'] >= min(g_target_60, g_target_70) - 5)
+            model.Add(daily_shifts['G'] <= max(g_target_60, g_target_70) + 5)
             model.Add(daily_shifts['2'] == rem - daily_shifts['G'])
 
 def add_total_off_days_constraint(model: cp_model.CpModel, x: Dict, E: int, D: int, days: List[date], public_holidays: List[str]):
@@ -70,9 +70,8 @@ def add_total_off_days_constraint(model: cp_model.CpModel, x: Dict, E: int, D: i
     for ei in range(E):
         num_wo = sum(x[(ei, di, 'WO')] for di in range(D))
         num_ph = sum(x[(ei, di, 'PH')] for di in range(D))
-        # Allow off days ±1 from target for feasibility
-        model.Add(num_wo + num_ph >= total_off_days_target - 1)
-        model.Add(num_wo + num_ph <= total_off_days_target + 1)
+        # HARD off-days constraint
+        model.Add(num_wo + num_ph == total_off_days_target)
 
 def add_work_and_shift_pattern_constraints(model: cp_model.CpModel, x: Dict, E: int, D: int):
     window_size = 6
@@ -89,18 +88,14 @@ def add_work_and_shift_pattern_constraints(model: cp_model.CpModel, x: Dict, E: 
             model.AddImplication(x[(ei, di, '2')], x[(ei, di + 1, '1')].Not())
 
 def add_monthly_shift_quota_constraints(model: cp_model.CpModel, x: Dict, E: int, D: int):
-    # Paid shift: allow 11-13 for strict fairness & feasibility
-    for ei in range(E):
-        count_paid = sum(x[(ei, di, s)] for di in range(D) for s in ['2', '3'])
-        model.Add(count_paid >= 11)
-        model.Add(count_paid <= 13)
+    # NO HARD PAID SHIFTS QUOTA
+    pass
 
 def add_fairness_and_sentiment_constraints(model: cp_model.CpModel, x: Dict, E: int, D: int, days: List[date], public_holidays: List[str]):
-    # For rare weekday/weekend/PH 1/2/3 assignments, spread out as much as possible
     ph_indices = [di for di, d in enumerate(days) if d.isoformat() in public_holidays]
     weekend_indices = [di for di, d in enumerate(days) if is_weekend(d)]
     rare_indices = sorted(set(ph_indices + weekend_indices))
-    # For each shift, balance rare assignments: max-min <= 2
+    # Fairness: max-min ≤ 4 for rare shift assignments for feasibility
     for s in ['1', '2', '3']:
         get_counts = [sum(x[(ei, di, s)] for di in rare_indices) for ei in range(E)]
         max_rare = model.NewIntVar(0, D, 'max_rare')
@@ -108,14 +103,13 @@ def add_fairness_and_sentiment_constraints(model: cp_model.CpModel, x: Dict, E: 
         for cnt in get_counts:
             model.Add(min_rare <= cnt)
             model.Add(cnt <= max_rare)
-        model.Add(max_rare - min_rare <= 2)
+        model.Add(max_rare - min_rare <= 4)
 
 def define_objective_function(model: cp_model.CpModel, x: Dict, E: int, D: int, days: List[date]):
     rare_shifts_gaps = []
     paid_shift_counts = [sum(x[(ei, di, s)] for di in range(D) for s in ['2', '3']) for ei in range(E)]
-    paid_avg = sum(paid_shift_counts)//E
+    paid_avg = sum(paid_shift_counts) // E
     paid_gaps = [abs(c - paid_avg) for c in paid_shift_counts]
-    # Penalize any excesses in rare and paid shifts
     rare_indices = [di for di, d in enumerate(days) if is_weekend(d) or d.isoformat() in [ds.isoformat() for ds in days]]
     for s in ['1', '2', '3']:
         shift_counts = [sum(x[(ei, di, s)] for di in rare_indices) for ei in range(E)]
